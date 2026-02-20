@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>끝말잇기</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 20px auto; padding: 0 12px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    input, button { padding:10px 12px; font-size:16px; }
+    button { cursor:pointer; }
+    .card { border:1px solid #ddd; border-radius:12px; padding:12px; margin-top:12px; }
+    .muted { color:#666; }
+    .badge { display:inline-block; padding:4px 10px; border-radius:999px; background:#f3f3f3; margin-right:6px; }
+    #log { white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:14px; }
+    .dead { text-decoration: line-through; color:#999; }
+  </style>
+</head>
+<body>
+  <h1>끝말잇기 (두음법칙 적용)</h1>
+
+  <div class="card">
+    <div class="row">
+      <input id="host" placeholder="서버주소 (예: localhost:8000)" value="localhost:8000" style="flex:1; min-width:220px;">
+      <input id="rid" placeholder="방 코드" style="width:140px;">
+      <input id="name" placeholder="닉네임" style="width:160px;">
+      <button id="joinBtn">입장</button>
+      <button id="startBtn" disabled>Start</button>
+    </div>
+    <div class="muted" style="margin-top:8px;">
+      새 방 만들기: 브라우저에서 <code>http://서버주소/create_room</code> 열고 나온 rid를 공유하면 됩니다.
+      (Start는 ✅ 누구나 누를 수 있어요)
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <span class="badge">현재 단어: <b id="currentWord">-</b></span>
+      <span class="badge">남은 시간: <b id="timer">-</b>s</span>
+    </div>
+
+    <div style="margin-top:10px;">
+      <div><span class="badge">현재 턴</span> <b id="turnName">-</b></div>
+      <div style="margin-top:6px;"><span class="badge">다음 턴</span> <b id="nextName">-</b></div>
+    </div>
+
+    <div class="row" style="margin-top:12px;">
+      <input id="word" placeholder="단어 입력" style="flex:1; min-width:260px;" disabled>
+      <button id="submitBtn" disabled>제출</button>
+    </div>
+    <div class="muted" style="margin-top:8px;">
+      내 턴일 때만 입력/제출이 활성화됩니다.
+    </div>
+  </div>
+
+  <div class="card">
+    <div><b>플레이어</b></div>
+    <div id="players" class="row" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
+    <div><b>로그</b></div>
+    <div id="log" style="margin-top:10px;"></div>
+  </div>
+
+<script>
+  let ws = null;
+  let myPid = null;
+  let timerInterval = null;
+
+  const $ = (id) => document.getElementById(id);
+
+  function logLine(s) {
+    $("log").textContent = (s + "\n") + $("log").textContent;
+  }
+
+  function setEnabledGameplay(enabled) {
+    $("word").disabled = !enabled;
+    $("submitBtn").disabled = !enabled;
+  }
+
+  function renderPlayers(players, turnPid) {
+    const box = $("players");
+    box.innerHTML = "";
+    players.forEach(p => {
+      const span = document.createElement("span");
+      span.className = "badge";
+      span.textContent = (p.pid === turnPid ? "👉 " : "") + p.name;
+      if (!p.alive) span.classList.add("dead");
+      box.appendChild(span);
+    });
+  }
+
+  function updateTimer(deadlineSec) {
+    if (timerInterval) clearInterval(timerInterval);
+
+    function tick() {
+      if (!deadlineSec) { $("timer").textContent = "-"; return; }
+      const leftMs = Math.max(0, (deadlineSec * 1000) - Date.now());
+      $("timer").textContent = Math.ceil(leftMs / 1000);
+    }
+
+    tick();
+    timerInterval = setInterval(tick, 200);
+  }
+
+  function applyState(st) {
+    $("currentWord").textContent = st.current_word ?? "-";
+    $("turnName").textContent = st.turn_name ?? "-";
+    $("nextName").textContent = st.next_name ?? "-";
+    renderPlayers(st.players || [], st.turn_pid);
+    updateTimer(st.deadline);
+
+    const isMyTurn = st.started && (st.turn_pid === myPid);
+    setEnabledGameplay(isMyTurn);
+
+    // ✅ 누구나 Start 가능: 연결만 되어있으면, 시작 전엔 활성화
+    $("startBtn").disabled = !ws || st.started;
+  }
+
+  $("joinBtn").onclick = () => {
+    const host = $("host").value.trim();
+    const rid = $("rid").value.trim();
+    const name = $("name").value.trim();
+    if (!host || !rid || !name) return alert("서버주소/방코드/닉네임을 입력해줘!");
+
+    ws = new WebSocket(`ws://${host}/ws/${rid}`);
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({type:"join", name}));
+      logLine(`[local] 입장 요청: room=${rid}, name=${name}`);
+    };
+
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+
+      if (msg.type === "joined") {
+        myPid = msg.pid;
+        logLine(`[system] joined! myPid=${myPid}`);
+        $("startBtn").disabled = false;
+        return;
+      }
+      if (msg.type === "state") {
+        applyState(msg);
+        return;
+      }
+      if (msg.type === "system") {
+        logLine(`[system] ${msg.msg}`);
+        return;
+      }
+      if (msg.type === "error") {
+        logLine(`[error] ${msg.msg}`);
+        return;
+      }
+      logLine(`[msg] ${ev.data}`);
+    };
+
+    ws.onclose = () => {
+      logLine("[local] 연결 종료");
+      setEnabledGameplay(false);
+      $("startBtn").disabled = true;
+      if (timerInterval) clearInterval(timerInterval);
+    };
+  };
+
+  $("startBtn").onclick = () => {
+    if (!ws) return;
+    ws.send(JSON.stringify({type:"start"}));
+  };
+
+  function submitWord() {
+    if (!ws) return;
+    const w = $("word").value.trim();
+    if (!w) return;
+    ws.send(JSON.stringify({type:"submit", word:w}));
+    $("word").value = "";
+  }
+
+  $("submitBtn").onclick = submitWord;
+  $("word").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submitWord();
+  });
+</script>
+</body>
+</html>
